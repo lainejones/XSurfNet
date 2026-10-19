@@ -100,8 +100,9 @@ extern ULONG xs_callcopy(APTR func, APTR to, APTR from, ULONG len);
 #define RCR_PRO  0x10
 
 /* 16 KB of buffer RAM at 0x4000: one transmit buffer, then the ring */
-#define TX_PAGE  0x40
-#define RX_START 0x46
+#define TX_PAGE  0x40             /* two transmit buffers, 6 pages each */
+#define TX_PAGE2 0x46
+#define RX_START 0x4C
 #define RX_STOP  0x80
 
 #define ETH_HDR  14
@@ -143,10 +144,14 @@ static volatile UBYTE imr_shadow;
 static struct Interrupt intr;
 static UBYTE mac[6], hwmac[6];
 static UBYTE online, configured, exclusive, promisc, hw_ok;
-static struct IOSana2Req *txbusy;
+static struct IOSana2Req *txbusy;   /* frame on the wire */
+static UBYTE txslot;                /* its buffer (TX_PAGE or TX_PAGE2) */
+static struct IOSana2Req *txnext;   /* next frame, already in the other buffer */
+static UWORD txnext_len;
 static struct McEntry mc[MAX_MC];
 static UBYTE mar[8];
 static struct Sana2DeviceStats stats;
+static ULONG n_ints, n_wakes, n_rxdrain, n_ovw, n_txmiss, n_corrupt;   /* S2_GETSPECIALSTATS */
 static UBYTE txbuf[ETH_MAX + 2] __attribute__((aligned(4)));
 static UBYTE rxbuf[ETH_MAX + 6] __attribute__((aligned(4)));
 
@@ -652,7 +657,9 @@ static int rx_drain(void)
 
 /* ---- transmit ----------------------------------------------------------- */
 
-static void tx_start(struct IOSana2Req *ior)
+/* copy a frame into the transmit buffer at page slot: its length, or 0 if
+ * the request failed (and was replied) */
+static UWORD tx_prepare(struct IOSana2Req *ior, UBYTE slot)
 {
     struct Opener *o = (struct Opener *)ior->ios2_BufferManagement;
     ULONG n = ior->ios2_DataLength;
@@ -660,13 +667,13 @@ static void tx_start(struct IOSana2Req *ior)
     int i;
 
     if (ior->ios2_Req.io_Flags & SANA2IOF_RAW) {
-        if (n > ETH_MAX || n < ETH_HDR) { fail(ior, S2ERR_MTU_EXCEEDED, 0); return; }
+        if (n > ETH_MAX || n < ETH_HDR) { fail(ior, S2ERR_MTU_EXCEEDED, 0); return 0; }
         if (!xs_callcopy(o->copyfrom, txbuf, ior->ios2_Data, n)) {
-            fail(ior, S2ERR_NO_RESOURCES, S2WERR_BUFF_ERROR); return;
+            fail(ior, S2ERR_NO_RESOURCES, S2WERR_BUFF_ERROR); return 0;
         }
         total = n;
     } else {
-        if (n > ETH_MTU) { fail(ior, S2ERR_MTU_EXCEEDED, 0); return; }
+        if (n > ETH_MTU) { fail(ior, S2ERR_MTU_EXCEEDED, 0); return 0; }
         for (i = 0; i < 6; i++) {
             txbuf[i] = (ior->ios2_Req.io_Command == S2_BROADCAST) ? 0xFF : ior->ios2_DstAddr[i];
             txbuf[6 + i] = mac[i];
@@ -674,19 +681,43 @@ static void tx_start(struct IOSana2Req *ior)
         txbuf[12] = ior->ios2_PacketType >> 8;
         txbuf[13] = ior->ios2_PacketType;
         if (!xs_callcopy(o->copyfrom, txbuf + ETH_HDR, ior->ios2_Data, n)) {
-            fail(ior, S2ERR_NO_RESOURCES, S2WERR_BUFF_ERROR); return;
+            fail(ior, S2ERR_NO_RESOURCES, S2WERR_BUFF_ERROR); return 0;
         }
         total = n + ETH_HDR;
     }
     while (total < ETH_MIN) txbuf[total++] = 0;
-    if (!rdma_write(TX_PAGE << 8, txbuf, total)) {
-        fail(ior, S2ERR_TX_FAILURE, S2WERR_GENERIC_ERROR); return;
+    if (!rdma_write(slot << 8, txbuf, total)) {
+        fail(ior, S2ERR_TX_FAILURE, S2WERR_GENERIC_ERROR); return 0;
     }
+    return total;
+}
+
+static void tx_fire(struct IOSana2Req *ior, UBYTE slot, UWORD total)
+{
     NW(ISR, ISR_PTX | ISR_TXE);     /* no stale completion for this frame */
-    NW(TPSR, TX_PAGE);
+    NW(TPSR, slot);
     NW(TBCR0, total); NW(TBCR1, total >> 8);
     NW(CR, CR_NODMA | CR_TXP | CR_STA);
     txbusy = ior;
+    txslot = slot;
+}
+
+/* a write from the queue: onto the wire if it is free, else into the other
+ * buffer so it can go the moment the current frame is out. 1 = must wait */
+static int tx_start(struct IOSana2Req *ior)
+{
+    UWORD total;
+    if (!txbusy) {
+        UBYTE slot = (txslot == TX_PAGE) ? TX_PAGE2 : TX_PAGE;
+        if ((total = tx_prepare(ior, slot))) tx_fire(ior, slot, total);
+        return 0;
+    }
+    if (txnext) return 1;
+    if ((total = tx_prepare(ior, txslot == TX_PAGE ? TX_PAGE2 : TX_PAGE))) {
+        txnext = ior;
+        txnext_len = total;
+    }
+    return 0;
 }
 
 static void tx_done(int ok)
@@ -694,6 +725,10 @@ static void tx_done(int ok)
     struct IOSana2Req *ior = txbusy;
     txbusy = NULL;
     if (!ior) return;
+    if (txnext) {                   /* the next frame is ready: send it first */
+        tx_fire(txnext, txslot == TX_PAGE ? TX_PAGE2 : TX_PAGE, txnext_len);
+        txnext = NULL;
+    }
     if (ok) {
         stats.PacketsSent++;
         ior->ios2_Req.io_Error = 0;
@@ -715,6 +750,7 @@ static void go_offline(void)
     nic_stop();
     online = 0;
     if (txbusy) { ior = txbusy; txbusy = NULL; fail(ior, S2ERR_OUTOFSERVICE, S2WERR_UNIT_OFFLINE); }
+    if (txnext) { ior = txnext; txnext = NULL; fail(ior, S2ERR_OUTOFSERVICE, S2WERR_UNIT_OFFLINE); }
     fire_events(S2EVENT_OFFLINE);
 }
 
@@ -735,9 +771,7 @@ static int run_cmd(struct IOSana2Req *ior)
     case S2_BROADCAST:
     case S2_MULTICAST:
         if (!online) { fail(ior, S2ERR_OUTOFSERVICE, S2WERR_UNIT_OFFLINE); return 0; }
-        if (txbusy) return 1;
-        tx_start(ior);
-        return 0;
+        return tx_start(ior);
     case S2_CONFIGINTERFACE:
         if (configured) { fail(ior, S2ERR_BAD_STATE, S2WERR_IS_CONFIGURED); return 0; }
         for (i = 0; i < 6; i++) mac[i] = ior->ios2_SrcAddr[i];
@@ -802,6 +836,7 @@ static void service(void)
              * not fit is lost */
             UBYTE txp = NR(CR) & CR_TXP, resend = 0;
             stats.Overruns++;
+            n_ovw++;
             NW(CR, CR_NODMA | CR_STP);
             wait_us(2000);
             NW(RBCR0, 0); NW(RBCR1, 0);
@@ -817,7 +852,8 @@ static void service(void)
         if (isr & (ISR_PRX | ISR_RXE)) {
             NW(ISR, ISR_PRX | ISR_RXE);
             if (isr & ISR_RXE) stats.BadData++;
-            if (online && !rx_drain()) { nic_start(); continue; }
+            n_rxdrain++;
+            if (online && !rx_drain()) { n_corrupt++; nic_start(); continue; }
         }
         if (isr & (ISR_PTX | ISR_TXE)) {
             NW(ISR, ISR_PTX | ISR_TXE);
@@ -825,6 +861,7 @@ static void service(void)
         }
         else if (txbusy && !(NR(CR) & CR_TXP)) {
             /* the chip is done but no PTX/TXE was seen: don't hold every write */
+            n_txmiss++;
             tx_done(1);
         }
         if (isr & ISR_CNT) {
@@ -837,13 +874,16 @@ static void service(void)
             Forbid();
             ior = (struct IOSana2Req *)cmdq.mlh_Head;
             if (!ior->ios2_Req.io_Message.mn_Node.ln_Succ) ior = NULL;
-            else if (txbusy && (ior->ios2_Req.io_Command == CMD_WRITE ||
+            else if (txbusy && txnext && (ior->ios2_Req.io_Command == CMD_WRITE ||
                                 ior->ios2_Req.io_Command == S2_BROADCAST ||
                                 ior->ios2_Req.io_Command == S2_MULTICAST)) ior = NULL;
             else Remove((struct Node *)ior);
             Permit();
             if (!ior) break;
-            run_cmd(ior);
+            if (run_cmd(ior)) {     /* both buffers full: back to the front */
+                Forbid(); AddHead((struct List *)&cmdq, (struct Node *)ior); Permit();
+                break;
+            }
         }
         if (!(NR(ISR) & IMR_ALL)) break;
     }
@@ -870,6 +910,7 @@ static void xs_proc(void)
     for (;;) {
         sigs = Wait(intmask | cmdmask | SIGBREAKF_CTRL_C);
         if (sigs & SIGBREAKF_CTRL_C) break;
+        n_wakes++;
         service();
         if (online) enable_ints();
     }
@@ -893,6 +934,7 @@ ULONG xs_interrupt(void)
     if (!isr) return 0;
     imr_shadow = 0;
     NW(IMR, 0);
+    n_ints++;
     Signal(proc, intmask);
     return 1;
 }
@@ -1113,7 +1155,30 @@ void xs_beginio(REG(a1, struct IOSana2Req *ior), REG(a6, struct Device *dev))
         break;
     case S2_GETSPECIALSTATS:
         if (!ior->ios2_StatData) { ior->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT; ior->ios2_WireError = S2WERR_NULL_POINTER; break; }
-        ((struct Sana2SpecialStatHeader *)ior->ios2_StatData)->RecordCountSupplied = 0;
+        {
+            /* driver internals, for xsstat: type 0x58530000 + n, Count = value */
+            struct Sana2SpecialStatHeader *h = (struct Sana2SpecialStatHeader *)ior->ios2_StatData;
+            ULONG *rec = (ULONG *)(h + 1);
+            ULONG v[12];
+            int k, nq = 0;
+            struct Node *nd;
+            struct Opener *o;
+            Forbid();
+            for (o = (struct Opener *)openers.mlh_Head; o->node.mln_Succ; o = (struct Opener *)o->node.mln_Succ)
+                for (nd = (struct Node *)o->readq.mlh_Head; nd->ln_Succ; nd = nd->ln_Succ) nq++;
+            v[0] = n_ints; v[1] = n_wakes; v[2] = n_rxdrain; v[3] = n_ovw; v[4] = n_txmiss; v[5] = n_corrupt;
+            v[6] = imr_shadow; v[7] = online; v[8] = txbusy != NULL; v[9] = txnext != NULL;
+            v[10] = nq;
+            for (k = 0, nd = (struct Node *)cmdq.mlh_Head; nd->ln_Succ; nd = nd->ln_Succ) k++;
+            v[11] = k;
+            Permit();
+            for (k = 0; k < 12 && k < (int)h->RecordCountMax; k++) {
+                rec[k * 3] = 0x58530000 + k;
+                rec[k * 3 + 1] = v[k];
+                rec[k * 3 + 2] = 0;
+            }
+            h->RecordCountSupplied = k;
+        }
         break;
     case CMD_FLUSH: {
         struct Opener *o;
