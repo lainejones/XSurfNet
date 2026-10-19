@@ -860,7 +860,11 @@ static void service(void)
             tx_done(!(isr & ISR_TXE) || (isr & ISR_PTX));
         }
         else if (txbusy && !(NR(CR) & CR_TXP)) {
-            /* the chip is done but no PTX/TXE was seen: don't hold every write */
+            /* The chip says the frame is out but the ISR read above was
+             * older: most often PTX is simply set by now, so look again and
+             * let the next pass complete it the normal way. Only with no
+             * PTX/TXE at all was the completion really missed. */
+            if (NR(ISR) & (ISR_PTX | ISR_TXE)) continue;
             n_txmiss++;
             tx_done(1);
         }
@@ -917,6 +921,13 @@ static void xs_proc(void)
 
     go_offline();
     nic_stop();
+    /* leave the chip as at power-on for whoever drives it next (another
+     * driver may not reset it): reset, stopped, 8-bit, no interrupts */
+    nic_reset();
+    NW(CR, CR_NODMA | CR_STP);
+    NW(DCR, 0x48);
+    NW(IMR, 0);
+    NW(ISR, 0xFF);
     RemIntServer(INTB_PORTS, &intr);
     FreeSignal(intsig); FreeSignal(cmdsig);
     intsig = cmdsig = -1;
