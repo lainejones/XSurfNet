@@ -249,25 +249,39 @@ static int rdma_wait(void)
     return 0;
 }
 
-static void rdma_read(UWORD addr, UBYTE *buf, UWORD len)
+static UBYTE dcr_value = 0x48;     /* DCR for normal work: 0x48 8-bit, 0x49 16-bit, 0x4B 16-bit + BOS */
+
+/* program a remote DMA: like the X-Surf's own driver, complete/abort any
+ * DMA first (CR 0x22 keeps the chip's run state otherwise unchanged) */
+static void rdma_setup(UWORD addr, UWORD len, UBYTE cmd)
 {
-    if (wordmode) len = (len + 1) & ~1;
+    NW(CR, CR_NODMA | CR_STA);
+    NW(ISR, ISR_RDC);
     NW(RBCR0, len); NW(RBCR1, len >> 8);
     NW(RSAR0, addr); NW(RSAR1, addr >> 8);
-    NW(CR, CR_RREAD | CR_STA);
-    if (wordmode) {
+    NW(CR, cmd | CR_STA);
+}
+
+/* 16-bit transfers move longs (two bus cycles each), so counts are rounded
+ * up to 4; every caller's buffer has the slack */
+static void rdma_read(UWORD addr, UBYTE *buf, UWORD len)
+{
+    if (wordmode) len = (len + 3) & ~3;
+    rdma_setup(addr, len, CR_RREAD);
+    if (wordmode && !swapmode) {
+        volatile ULONG *d = (volatile ULONG *)dataw;
+        ULONG *l = (ULONG *)buf;
+        UWORD n = len >> 2;
+        while (n >= 8) {
+            l[0] = *d; l[1] = *d; l[2] = *d; l[3] = *d;
+            l[4] = *d; l[5] = *d; l[6] = *d; l[7] = *d;
+            l += 8; n -= 8;
+        }
+        while (n--) *l++ = *d;
+    } else if (wordmode) {
         UWORD *w = (UWORD *)buf;
         UWORD n = len >> 1;
-        if (swapmode) {
-            while (n--) { UWORD v = *dataw; *w++ = (v << 8) | (v >> 8); }
-        } else {
-            while (n >= 8) {
-                w[0] = *dataw; w[1] = *dataw; w[2] = *dataw; w[3] = *dataw;
-                w[4] = *dataw; w[5] = *dataw; w[6] = *dataw; w[7] = *dataw;
-                w += 8; n -= 8;
-            }
-            while (n--) *w++ = *dataw;
-        }
+        while (n--) { UWORD v = *dataw; *w++ = (v << 8) | (v >> 8); }
     } else {
         while (len--) *buf++ = *datab;
     }
@@ -276,69 +290,111 @@ static void rdma_read(UWORD addr, UBYTE *buf, UWORD len)
 
 static int rdma_write(UWORD addr, const UBYTE *buf, UWORD len)
 {
-    if (wordmode) len = (len + 1) & ~1;
-    NW(ISR, ISR_RDC);
-    NW(RBCR0, len); NW(RBCR1, len >> 8);
-    NW(RSAR0, addr); NW(RSAR1, addr >> 8);
-    NW(CR, CR_RWRITE | CR_STA);
-    if (wordmode) {
+    if (wordmode) len = (len + 3) & ~3;
+    rdma_setup(addr, len, CR_RWRITE);
+    if (wordmode && !swapmode) {
+        volatile ULONG *d = (volatile ULONG *)dataw;
+        const ULONG *l = (const ULONG *)buf;
+        UWORD n = len >> 2;
+        while (n >= 8) {
+            *d = l[0]; *d = l[1]; *d = l[2]; *d = l[3];
+            *d = l[4]; *d = l[5]; *d = l[6]; *d = l[7];
+            l += 8; n -= 8;
+        }
+        while (n--) *d = *l++;
+    } else if (wordmode) {
         const UWORD *w = (const UWORD *)buf;
         UWORD n = len >> 1;
-        if (swapmode) {
-            while (n--) { UWORD v = *w++; *dataw = (v << 8) | (v >> 8); }
-        } else {
-            while (n >= 8) {
-                *dataw = w[0]; *dataw = w[1]; *dataw = w[2]; *dataw = w[3];
-                *dataw = w[4]; *dataw = w[5]; *dataw = w[6]; *dataw = w[7];
-                w += 8; n -= 8;
-            }
-            while (n--) *dataw = *w++;
-        }
+        while (n--) { UWORD v = *w++; *dataw = (v << 8) | (v >> 8); }
     } else {
         while (len--) *datab = *buf++;
     }
     return rdma_wait();
 }
 
-static void read_prom(void)
+/* Write a pattern with 16-bit moves (DCR dcr), read it back with 8-bit
+ * moves: 1 = arrives straight, 2 = bytes swapped in each word, 0 = neither.
+ * Only valid straight after a chip reset: on a real X-Surf, once an 8-bit
+ * transfer (the PROM read) has run, mixing 8- and 16-bit transfers returns
+ * every second byte wrong. */
+static char busdiag[80];
+static int busdiag_len;
+static void diag_add(const char *t)
 {
-    UBYTE prom[32];
-    int i;
-    NW(CR, CR_NODMA | CR_STP);
-    NW(DCR, 0x48);                  /* byte mode for the PROM */
-    wordmode = 0;
-    rdma_read(0, prom, 32);
-    for (i = 0; i < 6; i++) hwmac[i] = prom[i * 2];
+    while (*t && busdiag_len < (int)sizeof(busdiag) - 1) busdiag[busdiag_len++] = *t++;
+    busdiag[busdiag_len] = 0;
+}
+static void diag_hex(UBYTE v)
+{
+    static const char hx[] = "0123456789abcdef";
+    char t[4];
+    t[0] = ' '; t[1] = hx[v >> 4]; t[2] = hx[v & 15]; t[3] = 0;
+    diag_add(t);
 }
 
-/* Write a pattern as words, read it back as bytes (memory order): straight,
- * swapped within each word, or no usable word mode at all. */
-static void pick_bus_width(void)
+static int bus_try(UBYTE dcr)
 {
-    static UBYTE pat[32] __attribute__((aligned(2)));
-    UBYTE back[32] __attribute__((aligned(2)));
+    static UBYTE pat[32] __attribute__((aligned(4)));
+    UBYTE back[32] __attribute__((aligned(4)));
     int i, straight = 1, swapped = 1;
     for (i = 0; i < 32; i++) pat[i] = 0x5A ^ (i * 7);
     NW(CR, CR_NODMA | CR_STP);
-    NW(DCR, 0x49);
-    wordmode = 1;
     NW(RCR, 0x20);                  /* monitor */
     NW(TCR, 0x02);                  /* loopback */
     NW(PSTART, RX_START); NW(PSTOP, RX_STOP);
-    swapmode = 0;
+    /* An 8-bit write and read first: on a real X-Surf, straight after a
+     * reset, 8-bit reads return every second byte wrong until an 8-bit write
+     * has been done; after that they read back correctly. */
+    NW(DCR, 0x48);
+    wordmode = 0; swapmode = 0;
     rdma_write(TX_PAGE << 8, pat, 32);
+    rdma_read(TX_PAGE << 8, back, 32);
+    NW(DCR, dcr);
+    wordmode = 1;
+    i = rdma_write(TX_PAGE << 8, pat, 32);
+    diag_add(" [");
+    diag_hex(dcr);
+    diag_add(i ? " rdc" : " nordc");
     NW(DCR, 0x48);
     wordmode = 0;
     rdma_read(TX_PAGE << 8, back, 32);
+    for (i = 0; i < 6; i++) diag_hex(back[i]);
+    diag_add("]");
     for (i = 0; i < 32; i++) {
         if (back[i] != pat[i]) straight = 0;
         if (back[i] != pat[i ^ 1]) swapped = 0;
     }
-    if (straight || swapped) {
-        NW(DCR, 0x49);
-        wordmode = 1;
-        swapmode = !straight;
+    return straight ? 1 : swapped ? 2 : 0;
+}
+
+/* pick the bus mode, then read the station address in that mode */
+static void setup_bus_and_mac(void)
+{
+    UBYTE prom[32] __attribute__((aligned(4)));
+    int r, i;
+
+    nic_reset();
+    r = bus_try(0x49);
+    if (r == 2) {                   /* swapped: does the chip's byte-order bit fix it? */
+        nic_reset();
+        if (bus_try(0x4B) == 1) r = 3;
     }
+    nic_reset();
+    switch (r) {
+    case 1:  dcr_value = 0x49; wordmode = 1; swapmode = 0; break;
+    case 2:  dcr_value = 0x49; wordmode = 1; swapmode = 1; break;
+    case 3:  dcr_value = 0x4B; wordmode = 1; swapmode = 0; break;
+    default: dcr_value = 0x48; wordmode = 0; swapmode = 0; break;
+    }
+    NW(CR, CR_NODMA | CR_STP);
+    NW(RCR, 0x20);                  /* monitor, loopback while we look */
+    NW(TCR, 0x02);
+    NW(DCR, dcr_value);
+    /* the PROM holds each address byte twice (one 16-bit word per byte), so
+     * byte i is prom[2i] in either mode and whatever the byte order */
+    rdma_read(0, prom, 32);
+    for (i = 0; i < 6; i++) hwmac[i] = prom[i * 2];
+    NW(CR, CR_NODMA | CR_STP);
 }
 
 static ULONG crc32_be(const UBYTE *a)
@@ -406,7 +462,7 @@ static void nic_start(void)
 {
     disable_ints();
     NW(CR, CR_NODMA | CR_STP);
-    NW(DCR, wordmode ? 0x49 : 0x48);
+    NW(DCR, dcr_value);
     NW(RBCR0, 0); NW(RBCR1, 0);
     NW(RCR, 0x20);
     NW(TCR, 0x02);
@@ -543,22 +599,29 @@ static void dispatch(UWORD len)
     Permit();
 }
 
+static UBYTE read_curr(void)
+{
+    UBYTE c;
+    Disable();
+    NW(CR, CR_PAGE1 | CR_NODMA | CR_STA);
+    c = NR(CURR);
+    NW(CR, CR_NODMA | CR_STA);
+    Enable();
+    return c;
+}
+
 /* returns 0 if the ring looked corrupt (the caller restarts the chip) */
 static int rx_drain(void)
 {
     UBYTE hdr[4] __attribute__((aligned(2)));
+    UBYTE curr = read_curr();
     for (;;) {
-        UBYTE curr, bnry, page, next;
+        UBYTE bnry, page, next;
         UWORD count, len, first;
-        Disable();
-        NW(CR, CR_PAGE1 | CR_NODMA | CR_STA);
-        curr = NR(CURR);
-        NW(CR, CR_NODMA | CR_STA);
-        Enable();
         bnry = NR(BNRY);
         page = bnry + 1;
         if (page >= RX_STOP) page = RX_START;
-        if (page == curr) return 1;
+        if (page == curr && (curr = read_curr()) == page) return 1;
 
         rdma_read(page << 8, hdr, 4);
         next = hdr[1];
@@ -734,13 +797,21 @@ static void service(void)
     for (loops = 0; loops < 64; loops++) {
         isr = NR(ISR);
         if (isr & ISR_OVW) {
-            /* ring overrun: restart with an empty ring (frames are lost) */
-            struct IOSana2Req *t = txbusy;
+            /* ring overrun, handled as the DP8390 data sheet says: the
+             * frames already in the ring are kept, only the one that did
+             * not fit is lost */
+            UBYTE txp = NR(CR) & CR_TXP, resend = 0;
             stats.Overruns++;
-            txbusy = NULL;
-            nic_start();
-            if (t) { Forbid(); AddHead((struct List *)&cmdq, (struct Node *)t); Permit(); }
-            fire_events(S2EVENT_ERROR | S2EVENT_RX);
+            NW(CR, CR_NODMA | CR_STP);
+            wait_us(2000);
+            NW(RBCR0, 0); NW(RBCR1, 0);
+            if (txp && !(NR(ISR) & (ISR_PTX | ISR_TXE))) resend = 1;
+            NW(TCR, 0x02);
+            NW(CR, CR_NODMA | CR_STA);
+            if (!rx_drain()) { nic_start(); continue; }
+            NW(ISR, ISR_OVW | ISR_PRX | ISR_RXE);
+            NW(TCR, 0x00);
+            if (resend) NW(CR, CR_NODMA | CR_TXP | CR_STA);
             continue;
         }
         if (isr & (ISR_PRX | ISR_RXE)) {
@@ -842,13 +913,19 @@ static int hw_setup(void)
     dataw = (volatile UWORD *)(nic + ASIC_DATA * 2);
     datab = nic + ASIC_DATA * 2;
     if (!nic_present() && !(pnp_configure() && nic_present())) return 0;
-    nic_reset();
-    read_prom();
-    pick_bus_width();
+    setup_bus_and_mac();
     nic_stop();
     for (i = 0; i < 6; i++) mac[i] = hwmac[i];
     /* tell the user how the chip is driven (ENV:XSurfNet-Bus) */
-    SetVar("XSurfNet-Bus", wordmode ? (swapmode ? "16-bit, swapped" : "16-bit") : "8-bit", -1, GVF_GLOBAL_ONLY);
+    {
+        char msg[120];
+        const char *m = wordmode ? (swapmode ? "16-bit, swapped" : dcr_value == 0x4B ? "16-bit, BOS" : "16-bit") : "8-bit";
+        int k = 0;
+        while (*m) msg[k++] = *m++;
+        for (m = busdiag; *m && k < (int)sizeof(msg) - 1; ) msg[k++] = *m++;
+        msg[k] = 0;
+        SetVar("XSurfNet-Bus", msg, -1, GVF_GLOBAL_ONLY);
+    }
     return 1;
 }
 

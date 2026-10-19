@@ -4,7 +4,15 @@ CC      = m68k-amigaos-gcc
 CFLAGS  = -m68000 -Os -noixemul -Wall -Wno-pointer-sign -fomit-frame-pointer
 OUT     = out
 
-all: $(OUT)/xsprobe $(OUT)/xsurfnet.device $(OUT)/intlist
+all: $(OUT)/xsprobe $(OUT)/xsurfnet.device $(OUT)/intlist $(OUT)/xsword $(OUT)/xsflush
+
+$(OUT)/xsflush: tools/xsflush.c
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -s -o $@ $<
+
+$(OUT)/xsword: tools/xsword.c
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -s -o $@ $<
 
 $(OUT)/intlist: tools/intlist.c
 	@mkdir -p $(OUT)

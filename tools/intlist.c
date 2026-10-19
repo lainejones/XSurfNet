@@ -1,5 +1,5 @@
 /*
- * intlist - list the servers on the PORTS (INT2) interrupt chain.
+ * intlist - list the servers on the PORTS (INT2) and EXTER (INT6) chains.
  * Part of XSurfNet. GPL-3.0-only, see LICENSE.
  */
 #include <stdio.h>
@@ -9,12 +9,13 @@
 #include <hardware/intbits.h>
 #include <proto/exec.h>
 
-int main(void)
+static void show(int vec, const char *what)
 {
     struct List *l;
     struct Node *n;
+    printf("%s:\n", what);
     Disable();
-    l = (struct List *)SysBase->IntVects[INTB_PORTS].iv_Data;
+    l = (struct List *)SysBase->IntVects[vec].iv_Data;
     for (n = l->lh_Head; n->ln_Succ; n = n->ln_Succ) {
         struct Interrupt *i = (struct Interrupt *)n;
         Enable();
@@ -23,5 +24,11 @@ int main(void)
         Disable();
     }
     Enable();
+}
+
+int main(void)
+{
+    show(INTB_PORTS, "INT2 (PORTS)");
+    show(INTB_EXTER, "INT6 (EXTER)");
     return 0;
 }
