@@ -4,7 +4,11 @@ CC      = m68k-amigaos-gcc
 CFLAGS  = -m68000 -Os -noixemul -Wall -Wno-pointer-sign -fomit-frame-pointer
 OUT     = out
 
-all: $(OUT)/xsprobe $(OUT)/xsurfnet.device
+all: $(OUT)/xsprobe $(OUT)/xsurfnet.device $(OUT)/intlist
+
+$(OUT)/intlist: tools/intlist.c
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -s -o $@ $<
 
 $(OUT)/xsurfnet.device: dev/start.S dev/xsurfnet.c include/sana2.h
 	@mkdir -p $(OUT)

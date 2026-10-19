@@ -2,7 +2,10 @@
  * xsprobe - find an X-Surf, configure its RTL8019AS and read its MAC address.
  * Part of XSurfNet. GPL-3.0-only, see LICENSE.
  *
- *   xsprobe [NOPNP] [DUMP]
+ *   xsprobe [NOPNP] [DUMP] [PEEK]
+ *
+ * PEEK only reads the registers of a running chip (no reset, no PnP), so it
+ * can look at what a driver has set up.
  *
  * The X-Surf (Individual Computers, Zorro II 4626/23) is an ISA card on a Zorro
  * carrier: board offset 0x8000 is an ISA I/O window with every ISA address
@@ -129,8 +132,8 @@ static void read_prom(UBYTE *mac)
 
 int main(void)
 {
-    LONG args[2] = { 0, 0 };
-    struct RDArgs *rda = ReadArgs((CONST_STRPTR)"NOPNP/S,DUMP/S", args, NULL);
+    LONG args[3] = { 0, 0, 0 };
+    struct RDArgs *rda = ReadArgs((CONST_STRPTR)"NOPNP/S,DUMP/S,PEEK/S", args, NULL);
     struct ConfigDev *cd;
     UBYTE id[9], mac[6];
     int i, rc = RETURN_FAIL;
@@ -143,6 +146,26 @@ int main(void)
     printf("X-Surf at $%08lx, %lu KB, serial %08lx\n", (unsigned long)board,
            (unsigned long)(cd->cd_BoardSize >> 10), (unsigned long)cd->cd_Rom.er_SerialNumber);
 
+    if (args[2]) {
+        UBYTE cr = inb(NIC_BASE);
+        int pg;
+        printf("CR %02x\n", cr);
+        for (pg = 0; pg < 4; pg++) {
+            Disable();
+            outb(NIC_BASE, (cr & 0x3F) | 0x20 | (pg << 6));
+            {
+                UBYTE r[16];
+                for (i = 1; i < 16; i++) r[i] = inb(NIC_BASE + i);
+                outb(NIC_BASE, (cr & 0x3F) | 0x20);
+                Enable();
+                printf("page %d:", pg);
+                for (i = 1; i < 16; i++) printf(" %02x", r[i]);
+                printf("\n");
+            }
+        }
+        rc = RETURN_OK;
+        goto out;
+    }
     if (nic_present()) {
         printf("RTL8019AS already at ISA $%03x (EEPROM / jumpers)\n", NIC_BASE);
     } else if (args[0]) {

@@ -619,6 +619,7 @@ static void tx_start(struct IOSana2Req *ior)
     if (!rdma_write(TX_PAGE << 8, txbuf, total)) {
         fail(ior, S2ERR_TX_FAILURE, S2WERR_GENERIC_ERROR); return;
     }
+    NW(ISR, ISR_PTX | ISR_TXE);     /* no stale completion for this frame */
     NW(TPSR, TX_PAGE);
     NW(TBCR0, total); NW(TBCR1, total >> 8);
     NW(CR, CR_NODMA | CR_TXP | CR_STA);
@@ -750,6 +751,10 @@ static void service(void)
         if (isr & (ISR_PTX | ISR_TXE)) {
             NW(ISR, ISR_PTX | ISR_TXE);
             tx_done(!(isr & ISR_TXE) || (isr & ISR_PTX));
+        }
+        else if (txbusy && !(NR(CR) & CR_TXP)) {
+            /* the chip is done but no PTX/TXE was seen: don't hold every write */
+            tx_done(1);
         }
         if (isr & ISR_CNT) {
             (void)NR(0x0D); (void)NR(0x0E); (void)NR(0x0F);   /* tally counters */
