@@ -18,6 +18,9 @@ written and tested with [PrismNet](https://github.com/lainejones/PrismNet).
   the Plug and Play setup itself (I/O port 0x300).
 - **Overrun recovery as the DP8390 data sheet describes it:** when the 16 KB
   receive buffer fills, the frames already in it are kept.
+- **The card's work runs in a software interrupt:** the card's interrupt (and
+  each request from the stack) starts it at once, with no switch to a driver
+  task, which leaves more of the CPU for the stack and programs.
 - **Two transmit buffers:** the next frame is copied to the card while the
   current one is being sent.
 - **SANA-II direct buffers** (`S2_DMACopyToBuff32` / `S2_DMACopyFromBuff32`):
@@ -66,21 +69,23 @@ The source also has diagnostics that reset the chip (`xsprobe`, `xsword`,
 
 - `ENV:XSurfNet-Bus` (set by the driver) shows the bus mode it chose and what
   its bus test saw.
-- `ENV:XSurfNet-Pri` (optional) sets the priority of the driver's task, default
-  5. Read when the device is first opened.
+- `ENV:XSurfNet-Pri` (1.1) set the priority of the driver's task. Since 1.2 the
+  work runs in a software interrupt, so it no longer has any effect.
 
 ## Performance
 
-Measured on an A2000 with a TF536 (68030) and an X-Surf, with PrismNet 0.6.3,
+Measured on an A2000 with a TF536 (68030) and an X-Surf, with PrismNet 0.6.4,
 using PrismNet's `httpbench` against a PC on the same LAN (4 MB transfers):
 
-| Direction | Speed |
-|---|---|
-| Download (to the Amiga) | 830 KB/s |
-| Upload (from the Amiga) | 740 KB/s |
+| Direction | 1.2 | 1.1 |
+|---|---|---|
+| Download (to the Amiga) | 880-920 KB/s | 785-830 KB/s |
+| Upload (from the Amiga) | 800-820 KB/s | 690-740 KB/s |
 
-On that machine the 68030 is the limit: a full frame costs about 0.55 ms just
-to read from the card, and the TCP/IP stack about as much again.
+On that machine the 68030 is the limit: it is fully busy during a download. A
+full frame costs about 0.55 ms just to read from the card, and the TCP/IP stack
+about as much again. 1.2 gains by dropping the task switch per frame (about
+1,700 a second during a download with 1.1, about 300 with 1.2).
 
 The card itself moves about 2.7 MB/s through 16-bit transfers on that machine
 (`xsbus`), well above the 10 Mbit wire (about 1.2 MB/s), so the network rather
