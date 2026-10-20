@@ -144,6 +144,8 @@ static BYTE intsig = -1, cmdsig = -1;
 static ULONG intmask, cmdmask;
 static volatile UBYTE imr_shadow;
 static struct Interrupt intr;
+static struct Interrupt softint;    /* runs service(): the card's work, commands */
+static volatile UBYTE stopping;     /* set before the process takes the unit down */
 static UBYTE mac[6], hwmac[6];
 static UBYTE online, configured, exclusive, promisc, hw_ok;
 static struct IOSana2Req *txbusy;   /* frame on the wire */
@@ -510,7 +512,7 @@ static void fail(struct IOSana2Req *ior, BYTE err, ULONG wire)
 static void fire_events(ULONG what)
 {
     struct IOSana2Req *ior, *next;
-    Forbid();
+    Disable();                      /* the software interrupt, or the process at the end */
     for (ior = (struct IOSana2Req *)eventq.mlh_Head;
          (next = (struct IOSana2Req *)ior->ios2_Req.io_Message.mn_Node.ln_Succ); ior = next)
         if (ior->ios2_WireError & what) {
@@ -518,7 +520,7 @@ static void fire_events(ULONG what)
             ior->ios2_WireError &= what;
             ReplyMsg((struct Message *)ior);
         }
-    Permit();
+    Enable();
 }
 
 static void flush_list(struct MinList *l)
@@ -632,7 +634,7 @@ static void receive(UWORD fa, const UBYTE *eth, UWORD len)
     if (mcast && !promisc && !is_mc_listed(eth)) return;    /* a hash neighbour */
     stats.PacketsReceived++;
 
-    Forbid();
+    /* in the software interrupt: no task can change the queues meanwhile */
     for (o = (struct Opener *)openers.mlh_Head; o->node.mln_Succ && n < MAX_TAKERS;
          o = (struct Opener *)o->node.mln_Succ) {
         for (ior = (struct IOSana2Req *)o->readq.mlh_Head; ior->ios2_Req.io_Message.mn_Node.ln_Succ;
@@ -650,7 +652,6 @@ static void receive(UWORD fa, const UBYTE *eth, UWORD len)
             take[0] = ior; who[0] = (struct Opener *)ior->ios2_BufferManagement; n = 1;
         }
     }
-    Permit();
     if (!n && !filtered) { n_rxskip++; return; }    /* nobody wants it: don't even read it */
 
     /* one taker, no filter, and the stack hands out its buffer: one copy */
@@ -689,7 +690,6 @@ static void receive(UWORD fa, const UBYTE *eth, UWORD len)
     if (filtered) {
         /* openers with a packet filter, now that the data is here */
         int any = n;
-        Forbid();
         for (o = (struct Opener *)openers.mlh_Head; o->node.mln_Succ; o = (struct Opener *)o->node.mln_Succ) {
             if (!o->filter) continue;
             for (ior = (struct IOSana2Req *)o->readq.mlh_Head; ior->ios2_Req.io_Message.mn_Node.ln_Succ;
@@ -707,7 +707,6 @@ static void receive(UWORD fa, const UBYTE *eth, UWORD len)
             if ((ior = (struct IOSana2Req *)RemHead((struct List *)&orphanq)))
                 deliver_copy(ior, (struct Opener *)ior->ios2_BufferManagement, len, type, bc, mcast);
         }
-        Permit();
     }
 }
 
@@ -1001,22 +1000,33 @@ static void service(void)
 
         /* commands: run in order, but a write waits while one is on the wire */
         for (;;) {
-            Forbid();
             ior = (struct IOSana2Req *)cmdq.mlh_Head;
             if (!ior->ios2_Req.io_Message.mn_Node.ln_Succ) ior = NULL;
             else if (txbusy && txnext && (ior->ios2_Req.io_Command == CMD_WRITE ||
                                 ior->ios2_Req.io_Command == S2_BROADCAST ||
                                 ior->ios2_Req.io_Command == S2_MULTICAST)) ior = NULL;
             else Remove((struct Node *)ior);
-            Permit();
             if (!ior) break;
             if (run_cmd(ior)) {     /* both buffers full: back to the front */
-                Forbid(); AddHead((struct List *)&cmdq, (struct Node *)ior); Permit();
+                AddHead((struct List *)&cmdq, (struct Node *)ior);
                 break;
             }
         }
         if (!(NR(ISR) & IMR_ALL)) break;
     }
+}
+
+/* The card's work and the queued commands, as a software interrupt: it runs
+ * the moment the card's interrupt (or BeginIO) causes it, with no task switch.
+ * Software interrupts do not nest, and no task runs meanwhile, so this is the
+ * only code that touches the chip outside Disable(); tasks guard the queues
+ * it shares with them with Disable(), as Forbid() does not hold it off. */
+static void xs_soft(void)
+{
+    if (stopping) return;
+    n_wakes++;
+    service();
+    if (online) enable_ints();
 }
 
 static void xs_proc(void)
@@ -1033,6 +1043,12 @@ static void xs_proc(void)
     intr.is_Node.ln_Name = (char *)xs_devname;
     intr.is_Data = NULL;
     intr.is_Code = xs_intstub;
+    softint.is_Node.ln_Type = NT_INTERRUPT;
+    softint.is_Node.ln_Pri = 0;
+    softint.is_Node.ln_Name = (char *)xs_devname;
+    softint.is_Data = NULL;
+    softint.is_Code = (VOID (*)())xs_soft;
+    stopping = 0;
     proc = me;
     AddIntServer(INTB_PORTS, &intr);
     Signal(parent, SIGF_SINGLE);
@@ -1040,11 +1056,14 @@ static void xs_proc(void)
     for (;;) {
         sigs = Wait(intmask | cmdmask | SIGBREAKF_CTRL_C);
         if (sigs & SIGBREAKF_CTRL_C) break;
-        n_wakes++;
-        service();
-        if (online) enable_ints();
     }
 
+    /* no more software interrupts: the card's interrupt is masked first, so
+     * it causes none, and one already caused runs at Enable() and returns */
+    disable_ints();
+    Disable();
+    stopping = 1;
+    Enable();
     go_offline();
     nic_stop();
     /* leave the chip as at power-on for whoever drives it next (another
@@ -1072,7 +1091,7 @@ ULONG xs_interrupt(void)
     imr_shadow = 0;
     NW(IMR, 0);
     n_ints++;
-    Signal(proc, intmask);
+    Cause(&softint);
     return 1;
 }
 
@@ -1171,9 +1190,9 @@ void xs_open(REG(a1, struct IOSana2Req *ior), REG(d0, ULONG unitnum), REG(d1, UL
     o->dmato = (APTR)GetTagData(S2_DMACopyToBuff32, 0, (struct TagItem *)ior->ios2_BufferManagement);
     o->dmafrom = (APTR)GetTagData(S2_DMACopyFromBuff32, 0, (struct TagItem *)ior->ios2_BufferManagement);
     o->filter = (struct Hook *)GetTagData(S2_PacketFilter, 0, (struct TagItem *)ior->ios2_BufferManagement);
-    Forbid();
+    Disable();
     AddTail((struct List *)&openers, (struct Node *)o);
-    Permit();
+    Enable();
     if (flags & SANA2OPF_MINE) exclusive = 1;
     if (flags & SANA2OPF_PROM) promisc = 1;
     ior->ios2_BufferManagement = o;
@@ -1202,7 +1221,7 @@ BPTR xs_close(REG(a1, struct IOSana2Req *ior), REG(a6, struct Device *dev))
 {
     struct Opener *o = (struct Opener *)ior->ios2_BufferManagement;
     struct IOSana2Req *r, *next;
-    Forbid();
+    Disable();
     if (o) {
         Remove((struct Node *)o);
         flush_list(&o->readq);
@@ -1212,7 +1231,7 @@ BPTR xs_close(REG(a1, struct IOSana2Req *ior), REG(a6, struct Device *dev))
         for (r = (struct IOSana2Req *)eventq.mlh_Head; (next = (struct IOSana2Req *)r->ios2_Req.io_Message.mn_Node.ln_Succ); r = next)
             if (r->ios2_BufferManagement == o) { Remove((struct Node *)r); r->ios2_Req.io_Error = IOERR_ABORTED; ReplyMsg((struct Message *)r); }
     }
-    Permit();
+    Enable();
     if (o) FreeMem(o, sizeof(*o));
     ior->ios2_Req.io_Device = (struct Device *)-1;
     ior->ios2_Req.io_Unit = (struct Unit *)-1;
@@ -1279,10 +1298,10 @@ void xs_beginio(REG(a1, struct IOSana2Req *ior), REG(a6, struct Device *dev))
     case S2_ADDMULTICASTADDRESS:
     case S2_DELMULTICASTADDRESS:
         ior->ios2_Req.io_Flags &= ~IOF_QUICK;
-        Forbid();
+        Disable();
         AddTail((struct List *)&cmdq, (struct Node *)ior);
-        Permit();
-        Signal(proc, cmdmask);
+        Enable();
+        Cause(&softint);
         return;
     case S2_DEVICEQUERY:
         q = (struct Sana2DeviceQuery *)ior->ios2_StatData;
@@ -1314,7 +1333,7 @@ void xs_beginio(REG(a1, struct IOSana2Req *ior), REG(a6, struct Device *dev))
             int k, nq = 0;
             struct Node *nd;
             struct Opener *o;
-            Forbid();
+            Disable();
             for (o = (struct Opener *)openers.mlh_Head; o->node.mln_Succ; o = (struct Opener *)o->node.mln_Succ)
                 for (nd = (struct Node *)o->readq.mlh_Head; nd->ln_Succ; nd = nd->ln_Succ) nq++;
             v[0] = n_ints; v[1] = n_wakes; v[2] = n_rxdrain; v[3] = n_ovw; v[4] = n_txmiss; v[5] = n_corrupt;
@@ -1323,7 +1342,7 @@ void xs_beginio(REG(a1, struct IOSana2Req *ior), REG(a6, struct Device *dev))
             for (k = 0, nd = (struct Node *)cmdq.mlh_Head; nd->ln_Succ; nd = nd->ln_Succ) k++;
             v[11] = k;
             v[12] = n_rxdma; v[13] = n_txdma; v[14] = n_rxskip;
-            Permit();
+            Enable();
             for (k = 0; k < 15 && k < (int)h->RecordCountMax; k++) {
                 rec[k * 3] = 0x58530000 + k;
                 rec[k * 3 + 1] = v[k];
@@ -1334,12 +1353,12 @@ void xs_beginio(REG(a1, struct IOSana2Req *ior), REG(a6, struct Device *dev))
         break;
     case CMD_FLUSH: {
         struct Opener *o;
-        Forbid();
+        Disable();
         for (o = (struct Opener *)openers.mlh_Head; o->node.mln_Succ; o = (struct Opener *)o->node.mln_Succ)
             flush_list(&o->readq);
         flush_list(&orphanq);
         flush_list(&eventq);
-        Permit();
+        Enable();
         break;
     }
     default:
@@ -1350,9 +1369,9 @@ void xs_beginio(REG(a1, struct IOSana2Req *ior), REG(a6, struct Device *dev))
     }
     if (l) {
         ior->ios2_Req.io_Flags &= ~IOF_QUICK;
-        Forbid();
+        Disable();
         AddTail((struct List *)l, (struct Node *)ior);
-        Permit();
+        Enable();
         return;
     }
     reply(ior);
@@ -1365,17 +1384,17 @@ LONG xs_abortio(REG(a1, struct IOSana2Req *ior), REG(a6, struct Device *dev))
     struct MinList *lists[4];
     int i;
     lists[0] = &o->readq; lists[1] = &orphanq; lists[2] = &eventq; lists[3] = &cmdq;
-    Forbid();
+    Disable();
     for (i = 0; i < 4; i++)
         for (n = (struct Node *)lists[i]->mlh_Head; n->ln_Succ; n = n->ln_Succ)
             if (n == (struct Node *)ior) {
                 Remove(n);
                 ior->ios2_Req.io_Error = IOERR_ABORTED;
                 ReplyMsg((struct Message *)ior);
-                Permit();
+                Enable();
                 return 0;
             }
-    Permit();
+    Enable();
     return 0;
 }
 
