@@ -46,8 +46,12 @@ struct IOSana2Req {
 #define S2_CopyToBuff       (S2_Dummy + 1)
 #define S2_CopyFromBuff     (S2_Dummy + 2)
 #define S2_PacketFilter     (S2_Dummy + 3)
-#define S2_DMACopyToBuff32  (S2_Dummy + 4)   /* R3: a0 = cookie -> longword-aligned buffer or NULL */
-#define S2_DMACopyFromBuff32 (S2_Dummy + 5)
+#define S2_CopyToBuff16     (S2_Dummy + 4)   /* copy functions, like S2_CopyToBuff */
+#define S2_CopyFromBuff16   (S2_Dummy + 5)
+#define S2_CopyToBuff32     (S2_Dummy + 6)
+#define S2_CopyFromBuff32   (S2_Dummy + 7)
+#define S2_DMACopyToBuff32  (S2_Dummy + 8)   /* R3: a0 = cookie -> longword-aligned buffer or NULL */
+#define S2_DMACopyFromBuff32 (S2_Dummy + 9)
 
 /* Commands (CMD_READ / CMD_WRITE are the standard exec ones) */
 #define S2_DEVICEQUERY          (CMD_NONSTD + 0)
