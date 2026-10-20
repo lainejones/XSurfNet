@@ -35,9 +35,9 @@ _xs_devname:
 
     .globl  _xs_idstring
 _xs_idstring:
-    .ascii  "xsurfnet.device 1.1b3 (19.10.2026)"
+    .ascii  "xsurfnet.device 1.1 (19.10.2026)"
     .byte   13,10,0
-    .ascii  "$VER: xsurfnet.device 1.1b3 (19.10.2026) X-Surf SANA-II driver"
+    .ascii  "$VER: xsurfnet.device 1.1 (19.10.2026) X-Surf SANA-II driver"
     .byte   0
     .even
 

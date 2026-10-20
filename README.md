@@ -20,6 +20,11 @@ written and tested with [PrismNet](https://github.com/lainejones/PrismNet).
   receive buffer fills, the frames already in it are kept.
 - **Two transmit buffers:** the next frame is copied to the card while the
   current one is being sent.
+- **SANA-II direct buffers** (`S2_DMACopyToBuff32` / `S2_DMACopyFromBuff32`):
+  when the stack offers them (PrismNet 0.6.3 and newer), a received frame goes
+  from the card straight into the stack's buffer and a sent one straight from
+  it, without a copy in between. Otherwise the usual copy functions are used.
+- **Frames nobody asked for are not read** off the card at all.
 - **Leaves the card clean:** on the last close the chip is reset to its
   power-on state, so another driver can take over without a reboot.
 - Promiscuous mode, raw frames, broadcast and multicast writes, `S2_ONEVENT`,
@@ -49,22 +54,33 @@ drivers.
 In the `Tools` drawer of the package:
 
 - `xsstat` prints the driver's internal counters (interrupts, overruns,
-  missed transmit completions, queue lengths) while it runs.
+  missed transmit completions, queue lengths, frames moved through direct
+  buffers) while it runs.
 - `xsflush` removes `xsurfnet.device` from memory when nothing has it open, so
   the next open loads the file again (for updating without a reboot).
 
 The source also has diagnostics that reset the chip (`xsprobe`, `xsword`,
 `xsbus`); run those only while no driver uses the card.
 
+## Settings
+
+- `ENV:XSurfNet-Bus` (set by the driver) shows the bus mode it chose and what
+  its bus test saw.
+- `ENV:XSurfNet-Pri` (optional) sets the priority of the driver's task, default
+  5. Read when the device is first opened.
+
 ## Performance
 
-Measured on an A2000 with a TF536 (68030) and an X-Surf, with PrismNet, copying
-1 MB over TCP between the Amiga and a PC on the same LAN:
+Measured on an A2000 with a TF536 (68030) and an X-Surf, with PrismNet 0.6.3,
+using PrismNet's `httpbench` against a PC on the same LAN (4 MB transfers):
 
 | Direction | Speed |
 |---|---|
-| To the Amiga | 474-487 KB/s |
-| From the Amiga | 382-384 KB/s |
+| Download (to the Amiga) | 830 KB/s |
+| Upload (from the Amiga) | 740 KB/s |
+
+On that machine the 68030 is the limit: a full frame costs about 0.55 ms just
+to read from the card, and the TCP/IP stack about as much again.
 
 The card itself moves about 2.7 MB/s through 16-bit transfers on that machine
 (`xsbus`), well above the 10 Mbit wire (about 1.2 MB/s), so the network rather
