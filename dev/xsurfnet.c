@@ -1418,7 +1418,7 @@ struct Device *xs_init(REG(d0, BPTR seg))
     dev->dd_Library.lib_Node.ln_Name = (char *)xs_devname;
     dev->dd_Library.lib_Flags = LIBF_SUMUSED | LIBF_CHANGED;
     dev->dd_Library.lib_Version = 1;
-    dev->dd_Library.lib_Revision = 1;
+    dev->dd_Library.lib_Revision = 2;
     dev->dd_Library.lib_IdString = (APTR)xs_idstring;
     xsdev = dev;
     AddDevice(dev);
