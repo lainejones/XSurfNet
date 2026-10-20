@@ -35,9 +35,9 @@ _xs_devname:
 
     .globl  _xs_idstring
 _xs_idstring:
-    .ascii  "xsurfnet.device 1.0 (19.10.2026)"
+    .ascii  "xsurfnet.device 1.1b2 (19.10.2026)"
     .byte   13,10,0
-    .ascii  "$VER: xsurfnet.device 1.0 (19.10.2026) X-Surf SANA-II driver"
+    .ascii  "$VER: xsurfnet.device 1.1b2 (19.10.2026) X-Surf SANA-II driver"
     .byte   0
     .even
 
@@ -66,6 +66,17 @@ _xs_callcopy:
     move.l  52(sp),a0
     move.l  56(sp),a1
     move.l  60(sp),d0
+    jsr     (a2)
+    movem.l (sp)+,d2-d7/a2-a6
+    rts
+
+| ULONG xs_calldma(func, cookie): a SANA-II R3 DMA function (a0 = cookie),
+| returns its buffer pointer or NULL.
+    .globl  _xs_calldma
+_xs_calldma:
+    movem.l d2-d7/a2-a6,-(sp)
+    move.l  48(sp),a2
+    move.l  52(sp),a0
     jsr     (a2)
     movem.l (sp)+,d2-d7/a2-a6
     rts

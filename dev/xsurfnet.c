@@ -43,6 +43,7 @@ struct Library *UtilityBase;
 extern const char xs_devname[], xs_idstring[];
 extern void xs_intstub(void);
 extern ULONG xs_callcopy(APTR func, APTR to, APTR from, ULONG len);
+extern ULONG xs_calldma(APTR func, APTR cookie);
 
 /* ---- hardware ---------------------------------------------------------- */
 
@@ -126,6 +127,7 @@ struct Opener {
     struct MinNode node;
     struct MinList readq;
     APTR copyto, copyfrom;
+    APTR dmato, dmafrom;            /* SANA-II R3 direct buffers, may be NULL */
     struct Hook *filter;
 };
 
@@ -151,7 +153,7 @@ static UWORD txnext_len;
 static struct McEntry mc[MAX_MC];
 static UBYTE mar[8];
 static struct Sana2DeviceStats stats;
-static ULONG n_ints, n_wakes, n_rxdrain, n_ovw, n_txmiss, n_corrupt;   /* S2_GETSPECIALSTATS */
+static ULONG n_ints, n_wakes, n_rxdrain, n_ovw, n_txmiss, n_corrupt, n_rxdma, n_txdma, n_rxskip;   /* S2_GETSPECIALSTATS */
 static UBYTE txbuf[ETH_MAX + 2] __attribute__((aligned(4)));
 static UBYTE rxbuf[ETH_MAX + 6] __attribute__((aligned(4)));
 
@@ -548,60 +550,165 @@ static int is_mc_listed(const UBYTE *a)
 
 /* ---- receive ------------------------------------------------------------ */
 
-static void deliver(struct IOSana2Req *ior, struct Opener *o, UWORD len, UWORD type, int bc, int mcast)
+/* Read exactly len bytes (16-bit straight mode only): the transfer is rounded
+ * to a whole word for the chip, but nothing is written past buf[len - 1] - the
+ * buffer may be the stack's own, sized exactly. */
+static void rdma_read_exact(UWORD addr, UBYTE *buf, UWORD len)
 {
-    int raw = ior->ios2_Req.io_Flags & SANA2IOF_RAW;
-    UBYTE *from = raw ? rxbuf : rxbuf + ETH_HDR;
-    ULONG n = raw ? len : len - ETH_HDR;
+    volatile ULONG *d = (volatile ULONG *)dataw;
+    ULONG *l = (ULONG *)buf;
+    UWORD n = len >> 2;
+    rdma_setup(addr, (len + 1) & ~1, CR_RREAD);
+    while (n >= 8) {
+        l[0] = *d; l[1] = *d; l[2] = *d; l[3] = *d;
+        l[4] = *d; l[5] = *d; l[6] = *d; l[7] = *d;
+        l += 8; n -= 8;
+    }
+    while (n--) *l++ = *d;
+    buf = (UBYTE *)l;
+    if (len & 2) { *(UWORD *)buf = *dataw; buf += 2; }
+    if (len & 1) *buf = *dataw >> 8;
+    rdma_wait();
+}
+
+/* read n bytes of a received frame, from byte off of the frame (which starts at
+ * ring address fa), into dst, wrapping round the ring */
+static void ring_read(UWORD fa, UWORD off, UBYTE *dst, UWORD n)
+{
+    ULONG a = (ULONG)fa + off;
+    UWORD first;
+    if (a >= ((ULONG)RX_STOP << 8)) a -= (ULONG)(RX_STOP - RX_START) << 8;
+    first = ((ULONG)RX_STOP << 8) - a;
+    if (n > first) {                /* first is even: a is (page << 8) + even */
+        rdma_read_exact(a, dst, first);
+        rdma_read_exact(RX_START << 8, dst + first, n - first);
+    } else {
+        rdma_read_exact(a, dst, n);
+    }
+}
+
+static void fill_req(struct IOSana2Req *ior, const UBYTE *eth, UWORD len, UWORD type, int bc, int mcast)
+{
     int i;
     for (i = 0; i < 6; i++) {
-        ior->ios2_DstAddr[i] = rxbuf[i];
-        ior->ios2_SrcAddr[i] = rxbuf[6 + i];
+        ior->ios2_DstAddr[i] = eth[i];
+        ior->ios2_SrcAddr[i] = eth[6 + i];
     }
     ior->ios2_PacketType = type;
-    ior->ios2_DataLength = n;
+    ior->ios2_DataLength = (ior->ios2_Req.io_Flags & SANA2IOF_RAW) ? len : len - ETH_HDR;
     ior->ios2_Req.io_Flags &= ~(SANA2IOF_BCAST | SANA2IOF_MCAST);
     if (bc) ior->ios2_Req.io_Flags |= SANA2IOF_BCAST;
     else if (mcast) ior->ios2_Req.io_Flags |= SANA2IOF_MCAST;
     ior->ios2_Req.io_Error = 0;
     ior->ios2_WireError = 0;
-    if (!xs_callcopy(o->copyto, ior->ios2_Data, from, n)) {
+}
+
+/* deliver from rxbuf (the whole frame is there) with the opener's CopyToBuff */
+static void deliver_copy(struct IOSana2Req *ior, struct Opener *o, UWORD len, UWORD type, int bc, int mcast)
+{
+    int raw = ior->ios2_Req.io_Flags & SANA2IOF_RAW;
+    fill_req(ior, rxbuf, len, type, bc, mcast);
+    if (!xs_callcopy(o->copyto, ior->ios2_Data, raw ? rxbuf : rxbuf + ETH_HDR, ior->ios2_DataLength)) {
         ior->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
         ior->ios2_WireError = S2WERR_BUFF_ERROR;
     }
     ReplyMsg((struct Message *)ior);
 }
 
-static void dispatch(UWORD len)
-{
-    struct Opener *o;
-    struct IOSana2Req *ior;
-    UWORD type = (rxbuf[12] << 8) | rxbuf[13];
-    int bc = (rxbuf[0] & rxbuf[1] & rxbuf[2] & rxbuf[3] & rxbuf[4] & rxbuf[5]) == 0xFF;
-    int mcast = !bc && (rxbuf[0] & 1);
-    int taken = 0;
+#define MAX_TAKERS 8
 
-    if (mcast && !promisc && !is_mc_listed(rxbuf)) return;   /* a hash neighbour */
+/* One received frame: fa = its ring address, eth = its Ethernet header (already
+ * read), len = frame length without the CRC. The body is read only once a
+ * request wants it - straight into the stack's buffer when it offers one. */
+static void receive(UWORD fa, const UBYTE *eth, UWORD len)
+{
+    struct IOSana2Req *take[MAX_TAKERS], *ior;
+    struct Opener *who[MAX_TAKERS], *o;
+    UWORD type = (eth[12] << 8) | eth[13];
+    int bc = (eth[0] & eth[1] & eth[2] & eth[3] & eth[4] & eth[5]) == 0xFF;
+    int mcast = !bc && (eth[0] & 1);
+    int n = 0, i, filtered = 0;
+
+    if (mcast && !promisc && !is_mc_listed(eth)) return;    /* a hash neighbour */
     stats.PacketsReceived++;
 
     Forbid();
-    for (o = (struct Opener *)openers.mlh_Head; o->node.mln_Succ; o = (struct Opener *)o->node.mln_Succ) {
+    for (o = (struct Opener *)openers.mlh_Head; o->node.mln_Succ && n < MAX_TAKERS;
+         o = (struct Opener *)o->node.mln_Succ) {
         for (ior = (struct IOSana2Req *)o->readq.mlh_Head; ior->ios2_Req.io_Message.mn_Node.ln_Succ;
              ior = (struct IOSana2Req *)ior->ios2_Req.io_Message.mn_Node.ln_Succ) {
             if (ior->ios2_PacketType != type) continue;
-            if (o->filter && !CallHookPkt(o->filter, ior, rxbuf + ETH_HDR)) break;
+            if (o->filter) { filtered = 1; break; }     /* needs the data: decided below */
             Remove((struct Node *)ior);
-            deliver(ior, o, len, type, bc, mcast);
-            taken = 1;
+            take[n] = ior; who[n] = o; n++;
             break;
         }
     }
-    if (!taken) {
+    if (!n && !filtered) {
         stats.UnknownTypesReceived++;
-        if ((ior = (struct IOSana2Req *)RemHead((struct List *)&orphanq)))
-            deliver(ior, (struct Opener *)ior->ios2_BufferManagement, len, type, bc, mcast);
+        if ((ior = (struct IOSana2Req *)RemHead((struct List *)&orphanq))) {
+            take[0] = ior; who[0] = (struct Opener *)ior->ios2_BufferManagement; n = 1;
+        }
     }
     Permit();
+    if (!n && !filtered) { n_rxskip++; return; }    /* nobody wants it: don't even read it */
+
+    /* one taker, no filter, and the stack hands out its buffer: one copy */
+    if (n == 1 && !filtered && who[0]->dmato && wordmode && !swapmode) {
+        UBYTE *p = (UBYTE *)xs_calldma(who[0]->dmato, take[0]->ios2_Data);
+        if (p) {
+            ior = take[0];
+            fill_req(ior, eth, len, type, bc, mcast);
+            n_rxdma++;
+            if (ior->ios2_Req.io_Flags & SANA2IOF_RAW) {
+                for (i = 0; i < ETH_HDR; i++) p[i] = eth[i];
+                ring_read(fa, ETH_HDR, p + ETH_HDR, len - ETH_HDR);
+            } else {
+                ring_read(fa, ETH_HDR, p, len - ETH_HDR);
+            }
+            ReplyMsg((struct Message *)ior);
+            return;
+        }
+    }
+
+    /* the general way: the whole frame into rxbuf, then CopyToBuff */
+    for (i = 0; i < ETH_HDR; i++) rxbuf[i] = eth[i];
+    if (wordmode && !swapmode) {
+        ring_read(fa, ETH_HDR, rxbuf + ETH_HDR, len - ETH_HDR);
+    } else {                        /* 8-bit or swapped: the old reads (rxbuf has room) */
+        UWORD a = fa + ETH_HDR, first = (RX_STOP << 8) - a;
+        if (a >= (RX_STOP << 8)) { a -= (RX_STOP - RX_START) << 8; first = (RX_STOP << 8) - a; }
+        if (len - ETH_HDR > first) {
+            rdma_read(a, rxbuf + ETH_HDR, first);
+            rdma_read(RX_START << 8, rxbuf + ETH_HDR + first, len - ETH_HDR - first);
+        } else {
+            rdma_read(a, rxbuf + ETH_HDR, len - ETH_HDR);
+        }
+    }
+    for (i = 0; i < n; i++) deliver_copy(take[i], who[i], len, type, bc, mcast);
+    if (filtered) {
+        /* openers with a packet filter, now that the data is here */
+        int any = n;
+        Forbid();
+        for (o = (struct Opener *)openers.mlh_Head; o->node.mln_Succ; o = (struct Opener *)o->node.mln_Succ) {
+            if (!o->filter) continue;
+            for (ior = (struct IOSana2Req *)o->readq.mlh_Head; ior->ios2_Req.io_Message.mn_Node.ln_Succ;
+                 ior = (struct IOSana2Req *)ior->ios2_Req.io_Message.mn_Node.ln_Succ) {
+                if (ior->ios2_PacketType != type) continue;
+                if (!CallHookPkt(o->filter, ior, rxbuf + ETH_HDR)) break;
+                Remove((struct Node *)ior);
+                deliver_copy(ior, o, len, type, bc, mcast);
+                any = 1;
+                break;
+            }
+        }
+        if (!any) {
+            stats.UnknownTypesReceived++;
+            if ((ior = (struct IOSana2Req *)RemHead((struct List *)&orphanq)))
+                deliver_copy(ior, (struct Opener *)ior->ios2_BufferManagement, len, type, bc, mcast);
+        }
+        Permit();
+    }
 }
 
 static UBYTE read_curr(void)
@@ -618,37 +725,27 @@ static UBYTE read_curr(void)
 /* returns 0 if the ring looked corrupt (the caller restarts the chip) */
 static int rx_drain(void)
 {
-    UBYTE hdr[4] __attribute__((aligned(2)));
+    UBYTE h[4 + ETH_HDR + 2] __attribute__((aligned(4)));   /* ring header + Ethernet header */
     UBYTE curr = read_curr();
     for (;;) {
         UBYTE bnry, page, next;
-        UWORD count, len, first;
+        UWORD count;
         bnry = NR(BNRY);
         page = bnry + 1;
         if (page >= RX_STOP) page = RX_START;
         if (page == curr && (curr = read_curr()) == page) return 1;
 
-        rdma_read(page << 8, hdr, 4);
-        next = hdr[1];
-        count = hdr[2] | (hdr[3] << 8);
+        rdma_read(page << 8, h, 4 + ETH_HDR);      /* one transfer for both headers */
+        next = h[1];
+        count = h[2] | (h[3] << 8);
         if (next < RX_START || next >= RX_STOP || count < ETH_MIN + 4 || count > ETH_MAX + 4) {
             stats.BadData++;
             return 0;
         }
-        len = count - 4;            /* drop the CRC */
-        if (!(hdr[0] & 0x01)) {     /* not "received intact" */
+        if (!(h[0] & 0x01))                         /* not "received intact" */
             stats.BadData++;
-        } else {
-            UWORD addr = (page << 8) + 4;
-            first = (RX_STOP << 8) - addr;
-            if (len > first) {      /* wraps round the ring */
-                rdma_read(addr, rxbuf, first);
-                rdma_read(RX_START << 8, rxbuf + first, len - first);
-            } else {
-                rdma_read(addr, rxbuf, len);
-            }
-            dispatch(len);
-        }
+        else
+            receive((page << 8) + 4, h + 4, count - 4);     /* drop the CRC */
         bnry = next - 1;
         if (bnry < RX_START) bnry = RX_STOP - 1;
         NW(BNRY, bnry);
@@ -665,6 +762,35 @@ static UWORD tx_prepare(struct IOSana2Req *ior, UBYTE slot)
     ULONG n = ior->ios2_DataLength;
     UWORD total;
     int i;
+
+    /* the stack hands out its buffer: write it to the card directly (frames
+     * that need padding to 60 bytes take the copy below) */
+    if (o->dmafrom && wordmode && !swapmode) {
+        int raw = ior->ios2_Req.io_Flags & SANA2IOF_RAW;
+        if ((raw ? n : n + ETH_HDR) >= ETH_MIN && n <= (raw ? ETH_MAX : ETH_MTU)) {
+            UBYTE *p = (UBYTE *)xs_calldma(o->dmafrom, ior->ios2_Data);
+            if (p) {
+                n_txdma++;
+                if (raw) {
+                    if (!rdma_write(slot << 8, p, n)) { fail(ior, S2ERR_TX_FAILURE, S2WERR_GENERIC_ERROR); return 0; }
+                    return n;
+                }
+                for (i = 0; i < 6; i++) {
+                    txbuf[i] = (ior->ios2_Req.io_Command == S2_BROADCAST) ? 0xFF : ior->ios2_DstAddr[i];
+                    txbuf[6 + i] = mac[i];
+                }
+                txbuf[12] = ior->ios2_PacketType >> 8;
+                txbuf[13] = ior->ios2_PacketType;
+                /* header, then the data from byte 14 (overwrites the 2 bytes the
+                 * rounded header write put there) */
+                if (!rdma_write(slot << 8, txbuf, ETH_HDR) ||
+                    !rdma_write((slot << 8) + ETH_HDR, p, n)) {
+                    fail(ior, S2ERR_TX_FAILURE, S2WERR_GENERIC_ERROR); return 0;
+                }
+                return n + ETH_HDR;
+            }
+        }
+    }
 
     if (ior->ios2_Req.io_Flags & SANA2IOF_RAW) {
         if (n > ETH_MAX || n < ETH_HDR) { fail(ior, S2ERR_MTU_EXCEEDED, 0); return 0; }
@@ -984,12 +1110,24 @@ static int hw_setup(void)
 
 /* ---- device vectors ---------------------------------------------------- */
 
+static LONG proc_pri(void)
+{
+    char b[8];
+    LONG v = 0, sign = 1, n = GetVar("XSurfNet-Pri", b, sizeof(b), GVF_GLOBAL_ONLY);
+    char *c = b;
+    if (n <= 0) return 5;
+    if (*c == '-') { sign = -1; c++; }
+    while (*c >= '0' && *c <= '9') v = (v << 3) + (v << 1) + (*c++ - '0');   /* no libgcc multiply */
+    if (sign < 0) v = -v;
+    return (v < -20 || v > 30) ? 5 : v;
+}
+
 static void start_proc_wait(void)
 {
     parent = FindTask(NULL);
     SetSignal(0, SIGF_SINGLE);
     if (CreateNewProcTags(NP_Entry, (ULONG)xs_proc, NP_Name, (ULONG)xs_devname,
-                          NP_Priority, 5, NP_StackSize, 4096, TAG_DONE))
+                          NP_Priority, proc_pri(), NP_StackSize, 4096, TAG_DONE))
         Wait(SIGF_SINGLE);
 }
 
@@ -1030,6 +1168,8 @@ void xs_open(REG(a1, struct IOSana2Req *ior), REG(d0, ULONG unitnum), REG(d1, UL
     init_list(&o->readq);
     o->copyto = (APTR)GetTagData(S2_CopyToBuff, 0, (struct TagItem *)ior->ios2_BufferManagement);
     o->copyfrom = (APTR)GetTagData(S2_CopyFromBuff, 0, (struct TagItem *)ior->ios2_BufferManagement);
+    o->dmato = (APTR)GetTagData(S2_DMACopyToBuff32, 0, (struct TagItem *)ior->ios2_BufferManagement);
+    o->dmafrom = (APTR)GetTagData(S2_DMACopyFromBuff32, 0, (struct TagItem *)ior->ios2_BufferManagement);
     o->filter = (struct Hook *)GetTagData(S2_PacketFilter, 0, (struct TagItem *)ior->ios2_BufferManagement);
     Forbid();
     AddTail((struct List *)&openers, (struct Node *)o);
@@ -1170,7 +1310,7 @@ void xs_beginio(REG(a1, struct IOSana2Req *ior), REG(a6, struct Device *dev))
             /* driver internals, for xsstat: type 0x58530000 + n, Count = value */
             struct Sana2SpecialStatHeader *h = (struct Sana2SpecialStatHeader *)ior->ios2_StatData;
             ULONG *rec = (ULONG *)(h + 1);
-            ULONG v[12];
+            ULONG v[15];
             int k, nq = 0;
             struct Node *nd;
             struct Opener *o;
@@ -1182,8 +1322,9 @@ void xs_beginio(REG(a1, struct IOSana2Req *ior), REG(a6, struct Device *dev))
             v[10] = nq;
             for (k = 0, nd = (struct Node *)cmdq.mlh_Head; nd->ln_Succ; nd = nd->ln_Succ) k++;
             v[11] = k;
+            v[12] = n_rxdma; v[13] = n_txdma; v[14] = n_rxskip;
             Permit();
-            for (k = 0; k < 12 && k < (int)h->RecordCountMax; k++) {
+            for (k = 0; k < 15 && k < (int)h->RecordCountMax; k++) {
                 rec[k * 3] = 0x58530000 + k;
                 rec[k * 3 + 1] = v[k];
                 rec[k * 3 + 2] = 0;
